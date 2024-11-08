@@ -2,14 +2,27 @@ import errno
 import random
 import socket
 import struct
+import sys
 import threading
 import queue
 import time
 import logging
+import traceback
 
+# logging.basicConfig(format='%(message)s')
 logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.CRITICAL)
 logger.debug("Logger created")
+# handler = logging.StreamHandler(sys.stdout)
+# handler.setFormatter(logging.Formatter('%(message)s'))
+# logger.addHandler(handler)
+
+next_identy = -1
+def get_identy():
+    global next_identy
+    next_identy += 1
+    return next_identy
+
 
 class UDPBasedProtocol:
     def __init__(self, *, local_addr, remote_addr):
@@ -87,6 +100,9 @@ class MyTCPHeader:
         if sack_count is None:
             sack_count = cls.MAX_SACK_COUNT
         return struct.calcsize(cls.FMT) + sack_count * struct.calcsize(cls.FMT_SACK_BLOCK)
+    
+    def header_size(self):
+        return MyTCPHeader.size(sack_count=self.sack_count)
     
     def __repr__(self):
         return str(self.__dict__)
@@ -172,16 +188,19 @@ class Buffer:
         with self.lock:
             if begin is None:
                 begin = self.length
+            
+            # logging.debug(f"({self.__class__.__name__}) data = {data[:10]}..., size = {size}")
 
             if self.length < begin + size:
                 self.buffer += b'\x00' * (begin + size - self.length)
+                # logging.debug(f"Extended buf to {self.buffer}")
                 self.length = begin + size
 
-            self.buffer = self.buffer[:begin] + \
-                data + self.buffer[begin + size:]
+            # logging.debug(f"Buffer was {self.buffer}")
+            self.buffer = self.buffer[:begin] + data + self.buffer[begin + size:]
+            # logging.debug(f"Inserted into buf to {self.buffer}")
             
             return begin, begin + size
-
 
 class IncomingBuffer(Buffer):
     def __init__(self):
@@ -219,9 +238,11 @@ class IncomingBuffer(Buffer):
 
             self.wait_end = self.wait_begin + count
 
+            # logging.debug(f"Waiting: b={self.wait_begin}, e={self.wait_end}...")
             self.enough.wait_for(lambda: self.present_segments.contains(
                 self.wait_begin, self.wait_end))
 
+            # logging.debug(f"Waiting is over: len={self.length}, buf={self.buffer}")
             data = self.buffer[self.wait_begin:self.wait_end]
             self.wait_begin = self.wait_end
             self.wait_end = None
@@ -231,7 +252,6 @@ class IncomingBuffer(Buffer):
         with self.lock:
             return f"{{length = {self.length}, ps = {self.present_segments}, wb = {self.wait_begin}, we = {self.wait_end}}}"
 
-
 class OutcomingBuffer(Buffer):
     def __init__(self):
         super().__init__()
@@ -239,7 +259,7 @@ class OutcomingBuffer(Buffer):
 
     def put(self, data):
         size = len(data)
-        return super().put(data, size)        
+        return super().put(data, size)
 
     def acknowledge(self, left, right):
         with self.lock:
@@ -271,12 +291,12 @@ class OutcomingBuffer(Buffer):
 class MyTCPProtocol(UDPBasedProtocol):
     IP_HEADER_SIZE = 60
     MTU = 65536 - IP_HEADER_SIZE - MyTCPHeader.size()
-    WINDOW_SIZE = MTU * 5
+    WINDOW_SIZE = MTU * 16
     DELAY = 0.15
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.identy = random.randint(0, 2**16 - 1)
+        self.identy = get_identy()
         self.closed = False
         self.listen_thread = threading.Thread(target=self.listening_loop_)
         self.transmission_thread = threading.Thread(
@@ -284,18 +304,23 @@ class MyTCPProtocol(UDPBasedProtocol):
         self.incoming_buffer = IncomingBuffer()
         self.outcoming_buffer = OutcomingBuffer()
         self.write_queue = queue.PriorityQueue()
+        self.closed_lock = threading.Lock()
 
-        self.closed_lock = threading.RLock()
-        self.queue_lock = threading.RLock()
+        self.listen_thread.start()
+        self.transmission_thread.start()
         self.debug_(f"Created")
     
     def debug_(self, msg):
-        logger.debug(f"[{self.identy}] {msg}")
+        where = next(traceback.walk_stack(None))[0]
+        t = time.time()
+        ct = time.gmtime(t)
+        msg = f"<{self.identy}> [{time.strftime('%H:%M:%S', ct)}+{t - int(t):.03}] {{{where.f_code.co_filename.split('/')[-1]}:{where.f_lineno} ({where.f_code.co_name})}}: {msg}"
+        logger.debug(msg)
 
     @classmethod
     def build_segment(cls, header: MyTCPHeader, payload: bytes | None = None) -> bytes:
         if payload is not None:
-            header.size = len(payload)
+            header.payload_size = len(payload)
         segment = header.to_bytes()
         if payload is not None:
             segment += payload
@@ -303,12 +328,12 @@ class MyTCPProtocol(UDPBasedProtocol):
         return segment
 
     @classmethod
-    def parse_segment(cls, segment: bytes) -> bytes:
+    def parse_segment(cls, segment: bytes) -> tuple[MyTCPHeader, bytes]:
         header = MyTCPHeader.from_tcp_segment(segment)
-        if header.size() == len(segment):
-            return header, None       
+        if header.header_size() == len(segment):
+            return header, b''       
 
-        return header, segment[header.size():]
+        return header, segment[header.header_size():]
 
     def process_incoming_segment_(self, header: MyTCPHeader, data: bytes | None):
         if header.ack:
@@ -320,21 +345,22 @@ class MyTCPProtocol(UDPBasedProtocol):
                 self.debug_(f"SAck on [{left}, {right}]")
         if header.payload_size > 0:
             self.incoming_buffer.put(data, header.payload_size, header.seq_num)
-            self.debug_(f"Incoming data [{header.seq_num}, {header.seq_num + header.payload_size}]")
+            self.debug_(f"Incoming data [{header.seq_num}, {header.seq_num + header.payload_size}) -- {data[:10]}...")
+            self.send_acknowledgement_()
 
     def listening_loop_(self):
         while not self.is_closed():
             try:
+                self.debug_(f"Listening...")
                 segment = self.recvfrom(self.MTU)
+                self.debug_(f"Received")
                 header, data = self.parse_segment(segment)
-                self.debug_(f"Parsed segment with header = {header}")
+                self.debug_(f"Parsed segment with len={len(segment)}, header={header} () and data={data[:10]}... (sz={len(data)})")
                 self.process_incoming_segment_(header, data)
-            except socket.error as e:
-                if e.errno == errno.EINVAL:
-                    pass
-                break
-            except:
-                break
+            except Exception as e:
+                self.debug_(f"Exception: {e}")
+                continue
+        self.debug_(f"Quit listening")
 
     def transmission_loop_(self):
         while not self.is_closed():
@@ -347,10 +373,14 @@ class MyTCPProtocol(UDPBasedProtocol):
                 else:
                     task()
             except Exception:
+                self.debug_(f"Transmission exception")
                 continue
+        
+        self.debug_(f"Quit transmission")
     
     def retransmit_(self, segment, begin, end):
         if self.outcoming_buffer.is_acknowledged(begin, end):
+            self.debug_(f"Retransmission cancelled [{begin}, {end})")
             return
         
         self.debug_(f"Retransmission [{begin}, {end})")
@@ -358,7 +388,7 @@ class MyTCPProtocol(UDPBasedProtocol):
         self.shedule_retransmission_(segment, begin, end)
 
     def send_acknowledgement_(self):
-        ack_num = self.incoming_buffer.get_missing(1)
+        ack_num = self.incoming_buffer.get_ack_num()
         # TODO: selective ack
         self.debug_(f"Send ack {ack_num}")
         self.send_segment_(self.build_segment(MyTCPHeader(0, ack_num, False, True)))
@@ -368,41 +398,64 @@ class MyTCPProtocol(UDPBasedProtocol):
     
     def send_part_(self, data: bytes):
         begin, end = self.outcoming_buffer.put(data)
-        segment = self.build_segment(MyTCPHeader(begin, 0, False, False, payload_size=end-begin), data)
+        header = MyTCPHeader(begin, 0, False, False, payload_size=end-begin)
+        segment = self.build_segment(header, data)
+        self.debug_(f"Built segment with len={len(segment)}, header={header} () and data={data[:10]}... (sz={len(data)})")
         self.send_segment_(segment)
         self.shedule_retransmission_(segment, begin, end)
+        self.debug_(f"Send part [{begin}, {end})")
+        return len(data)
     
-    def shedule_(self, task, delay):
+    def shedule_task_(self, task, delay):
         self.write_queue.put((time.monotonic() + delay, task))
     
     def shedule_retransmission_(self, segment, begin, end, delay=None):
         if delay is None:
             delay = self.DELAY
 
-        self.shedule_(lambda: self.retransmit_(segment, begin, end), delay)
+        self.shedule_task_(lambda: self.retransmit_(segment, begin, end), delay)
 
     def send(self, data: bytes):
+        self.debug_(f"Send {len(data)} bytes ({data[:10]}...)")
         window_begin = self.outcoming_buffer.window_begin()
         window_final = window_begin + len(data)
         total = 0
         window_end = window_begin
         while window_begin != window_final:
+            # Насыщение окна
             while window_end != window_final and window_end - window_begin < self.WINDOW_SIZE:
-                pass
-            total += self.send_part_(data[:self.MTU])
-            data = data[self.MTU:]
+                piece = data[:self.MTU]
+                piece_size = self.send_part_(piece)
+                total += piece_size
+                window_end += piece_size
+                data = data[self.MTU:]
+            
+            # Сдвиг левой части
+            _, new_window_begin = self.outcoming_buffer.wait_window_change(window_begin)
+            self.debug_(f"new_window_begin = {new_window_begin}, window_begin = {window_begin}")
+            assert new_window_begin - window_begin > 0
+            window_begin = new_window_begin
+        
+        # window_begin == window_final --- все дошли
+        self.debug_(f"Sent all {total} bytes")
+        return total
 
     def recv(self, n: int):
-        return self.incoming_buffer.get_next(n)
+        self.debug_(f"Receiving {n} bytes")
+        n = self.incoming_buffer.get_next(n)
+        self.debug_(f"Received all {n} bytes")
+        return n
 
     def is_closed(self):
         with self.closed_lock:
             return self.closed
 
     def close(self):
+        self.debug_("Closing...")
         with self.closed_lock:
             self.closed = True
 
         super().close()
         self.listen_thread.join()
         self.transmission_thread.join()
+        self.debug_("Closed...")
