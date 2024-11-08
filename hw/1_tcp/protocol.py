@@ -1,10 +1,15 @@
 import errno
+import random
 import socket
 import struct
 import threading
 import queue
 import time
+import logging
 
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)
+logger.debug("Logger created")
 
 class UDPBasedProtocol:
     def __init__(self, *, local_addr, remote_addr):
@@ -55,8 +60,7 @@ class MyTCPHeader:
         )
         if self.sack_blocks:
             if len(self.sack_blocks) != self.sack_count:
-                raise ValueError(f"{self.sack_blocks} and {
-                                 self.sack_count} do not match")
+                raise ValueError(f"{self.sack_blocks} and {self.sack_count} do not match")
             packed_data += b''.join(map(lambda t: struct.pack(
                 self.FMT_SACK_BLOCK, t[0], t[1]), self.sack_blocks))
         return packed_data
@@ -83,7 +87,9 @@ class MyTCPHeader:
         if sack_count is None:
             sack_count = cls.MAX_SACK_COUNT
         return struct.calcsize(cls.FMT) + sack_count * struct.calcsize(cls.FMT_SACK_BLOCK)
-
+    
+    def __repr__(self):
+        return str(self.__dict__)
 
 class Buffer:
     class PresentSegments:
@@ -198,6 +204,13 @@ class IncomingBuffer(Buffer):
     def get_missing(self, max_count: int = None, begin=0):
         with self.lock:
             return self.present_segments.get_missing(max_count, begin)
+    
+    def get_ack_num(self):
+        missing = self.present_segments.get_missing(max_count=1)
+        if len(missing):
+            return missing[0][0]
+        else:
+            return self.length       
 
     def get_next(self, count):
         with self.enough:
@@ -213,11 +226,16 @@ class IncomingBuffer(Buffer):
             self.wait_begin = self.wait_end
             self.wait_end = None
             return data
+    
+    def __repr__(self):
+        with self.lock:
+            return f"{{length = {self.length}, ps = {self.present_segments}, wb = {self.wait_begin}, we = {self.wait_end}}}"
 
 
 class OutcomingBuffer(Buffer):
     def __init__(self):
         super().__init__()
+        self.window_changed = threading.Condition(self.lock)
 
     def put(self, data):
         size = len(data)
@@ -225,19 +243,40 @@ class OutcomingBuffer(Buffer):
 
     def acknowledge(self, left, right):
         with self.lock:
+            old_window_start = self.window_begin()
             self.present_segments.put(left, right)
+            if old_window_start != self.window_begin():
+                self.window_changed.notify()
     
     def is_acknowledged(self, left, right):
         with self.lock:
             return self.present_segments.contains(left, right)
-
+    
+    def window_begin(self):
+        missing = self.present_segments.get_missing(max_count=1)
+        if len(missing):
+            return missing[0][0]
+        else:
+            return self.length
+    
+    def wait_window_change(self, window_begin):
+        with self.window_changed:
+            self.window_changed.wait_for(lambda: window_begin != self.window_begin())
+            return window_begin, self.window_begin()
+    
+    def __repr__(self):
+        with self.lock:
+            return f"{{length = {self.length}, ps = {self.present_segments}}}"
 
 class MyTCPProtocol(UDPBasedProtocol):
     IP_HEADER_SIZE = 60
     MTU = 65536 - IP_HEADER_SIZE - MyTCPHeader.size()
+    WINDOW_SIZE = MTU * 5
+    DELAY = 0.15
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.identy = random.randint(0, 2**16 - 1)
         self.closed = False
         self.listen_thread = threading.Thread(target=self.listening_loop_)
         self.transmission_thread = threading.Thread(
@@ -248,6 +287,10 @@ class MyTCPProtocol(UDPBasedProtocol):
 
         self.closed_lock = threading.RLock()
         self.queue_lock = threading.RLock()
+        self.debug_(f"Created")
+    
+    def debug_(self, msg):
+        logger.debug(f"[{self.identy}] {msg}")
 
     @classmethod
     def build_segment(cls, header: MyTCPHeader, payload: bytes | None = None) -> bytes:
@@ -263,24 +306,28 @@ class MyTCPProtocol(UDPBasedProtocol):
     def parse_segment(cls, segment: bytes) -> bytes:
         header = MyTCPHeader.from_tcp_segment(segment)
         if header.size() == len(segment):
-            return header, None
+            return header, None       
 
         return header, segment[header.size():]
 
-    def process_incoming_segment_(self, header: MyTCPHeader, data: bytes):
+    def process_incoming_segment_(self, header: MyTCPHeader, data: bytes | None):
         if header.ack:
             self.outcoming_buffer.acknowledge(0, header.ack_num)
+            self.debug_(f"Ack on {header.ack_num}")
         if header.sack_count > 0:
             for (left, right) in header.sack_blocks:
                 self.outcoming_buffer.acknowledge(left, right)
+                self.debug_(f"SAck on [{left}, {right}]")
         if header.payload_size > 0:
             self.incoming_buffer.put(data, header.payload_size, header.seq_num)
+            self.debug_(f"Incoming data [{header.seq_num}, {header.seq_num + header.payload_size}]")
 
     def listening_loop_(self):
         while not self.is_closed():
             try:
                 segment = self.recvfrom(self.MTU)
                 header, data = self.parse_segment(segment)
+                self.debug_(f"Parsed segment with header = {header}")
                 self.process_incoming_segment_(header, data)
             except socket.error as e:
                 if e.errno == errno.EINVAL:
@@ -302,11 +349,48 @@ class MyTCPProtocol(UDPBasedProtocol):
             except Exception:
                 continue
     
-    def send_part(self, data: bytes):
-        pass
+    def retransmit_(self, segment, begin, end):
+        if self.outcoming_buffer.is_acknowledged(begin, end):
+            return
+        
+        self.debug_(f"Retransmission [{begin}, {end})")
+        self.send_segment_(segment)
+        self.shedule_retransmission_(segment, begin, end)
+
+    def send_acknowledgement_(self):
+        ack_num = self.incoming_buffer.get_missing(1)
+        # TODO: selective ack
+        self.debug_(f"Send ack {ack_num}")
+        self.send_segment_(self.build_segment(MyTCPHeader(0, ack_num, False, True)))
+    
+    def send_segment_(self, segment: bytes):
+        super().sendto(segment)
+    
+    def send_part_(self, data: bytes):
+        begin, end = self.outcoming_buffer.put(data)
+        segment = self.build_segment(MyTCPHeader(begin, 0, False, False, payload_size=end-begin), data)
+        self.send_segment_(segment)
+        self.shedule_retransmission_(segment, begin, end)
+    
+    def shedule_(self, task, delay):
+        self.write_queue.put((time.monotonic() + delay, task))
+    
+    def shedule_retransmission_(self, segment, begin, end, delay=None):
+        if delay is None:
+            delay = self.DELAY
+
+        self.shedule_(lambda: self.retransmit_(segment, begin, end), delay)
 
     def send(self, data: bytes):
-        return self.sendto(data)
+        window_begin = self.outcoming_buffer.window_begin()
+        window_final = window_begin + len(data)
+        total = 0
+        window_end = window_begin
+        while window_begin != window_final:
+            while window_end != window_final and window_end - window_begin < self.WINDOW_SIZE:
+                pass
+            total += self.send_part_(data[:self.MTU])
+            data = data[self.MTU:]
 
     def recv(self, n: int):
         return self.incoming_buffer.get_next(n)
