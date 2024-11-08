@@ -11,11 +11,11 @@ import traceback
 
 # logging.basicConfig(format='%(message)s')
 logger = logging.getLogger()
-logger.setLevel(logging.CRITICAL)
+logger.setLevel(logging.DEBUG)
 logger.debug("Logger created")
-# handler = logging.StreamHandler(sys.stdout)
-# handler.setFormatter(logging.Formatter('%(message)s'))
-# logger.addHandler(handler)
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(logging.Formatter('%(message)s'))
+logger.addHandler(handler)
 
 next_identy = -1
 def get_identy():
@@ -30,6 +30,7 @@ class UDPBasedProtocol:
             family=socket.AF_INET, type=socket.SOCK_DGRAM)
         self.remote_addr = remote_addr
         self.udp_socket.bind(local_addr)
+        self.udp_socket.settimeout(1.0)
 
     def sendto(self, data):
         return self.udp_socket.sendto(data, self.remote_addr)
@@ -309,13 +310,27 @@ class MyTCPProtocol(UDPBasedProtocol):
         self.listen_thread.start()
         self.transmission_thread.start()
         self.debug_(f"Created")
-    
+
     def debug_(self, msg):
         where = next(traceback.walk_stack(None))[0]
         t = time.time()
         ct = time.gmtime(t)
         msg = f"<{self.identy}> [{time.strftime('%H:%M:%S', ct)}+{t - int(t):.03}] {{{where.f_code.co_filename.split('/')[-1]}:{where.f_lineno} ({where.f_code.co_name})}}: {msg}"
         logger.debug(msg)
+    
+    def info_(self, msg):
+        where = next(traceback.walk_stack(None))[0]
+        t = time.time()
+        ct = time.gmtime(t)
+        msg = f"<{self.identy}> [{time.strftime('%H:%M:%S', ct)}+{t - int(t):.03}] {{{where.f_code.co_filename.split('/')[-1]}:{where.f_lineno} ({where.f_code.co_name})}}: {msg}"
+        logger.info(msg)
+    
+    def critical_(self, msg):
+        where = next(traceback.walk_stack(None))[0]
+        t = time.time()
+        ct = time.gmtime(t)
+        msg = f"<{self.identy}> [{time.strftime('%H:%M:%S', ct)}+{t - int(t):.03}] {{{where.f_code.co_filename.split('/')[-1]}:{where.f_lineno} ({where.f_code.co_name})}}: {msg}"
+        logger.critical(msg)
 
     @classmethod
     def build_segment(cls, header: MyTCPHeader, payload: bytes | None = None) -> bytes:
@@ -357,10 +372,16 @@ class MyTCPProtocol(UDPBasedProtocol):
                 header, data = self.parse_segment(segment)
                 self.debug_(f"Parsed segment with len={len(segment)}, header={header} () and data={data[:10]}... (sz={len(data)})")
                 self.process_incoming_segment_(header, data)
-            except Exception as e:
-                self.debug_(f"Exception: {e}")
+            except socket.timeout as e:
+                self.critical_(f"Listening socket timeout: {e}")
                 continue
-        self.debug_(f"Quit listening")
+            except socket.error as e:
+                self.critical_(f"Listening socket exc: {e}")
+                break
+            except Exception as e:
+                self.critical_(f"Exception: {e}")
+                continue
+        self.info_(f"Quit listening")
 
     def transmission_loop_(self):
         while not self.is_closed():
@@ -372,11 +393,14 @@ class MyTCPProtocol(UDPBasedProtocol):
                     self.write_queue.put((execution_time, task))
                 else:
                     task()
-            except Exception:
-                self.debug_(f"Transmission exception")
+            except socket.error as e:
+                self.critical_(f"Transmission socket exc: {e}")
+                break
+            except Exception as e:
+                self.critical_(f"Transmission exception: {e}")
                 continue
         
-        self.debug_(f"Quit transmission")
+        self.info_(f"Quit transmission")
     
     def retransmit_(self, segment, begin, end):
         if self.outcoming_buffer.is_acknowledged(begin, end):
@@ -416,6 +440,7 @@ class MyTCPProtocol(UDPBasedProtocol):
         self.shedule_task_(lambda: self.retransmit_(segment, begin, end), delay)
 
     def send(self, data: bytes):
+        old_data = data
         self.debug_(f"Send {len(data)} bytes ({data[:10]}...)")
         window_begin = self.outcoming_buffer.window_begin()
         window_final = window_begin + len(data)
@@ -437,25 +462,25 @@ class MyTCPProtocol(UDPBasedProtocol):
             window_begin = new_window_begin
         
         # window_begin == window_final --- все дошли
-        self.debug_(f"Sent all {total} bytes")
+        self.info_(f"Sent all {total} bytes {old_data}")
         return total
 
     def recv(self, n: int):
         self.debug_(f"Receiving {n} bytes")
-        n = self.incoming_buffer.get_next(n)
-        self.debug_(f"Received all {n} bytes")
-        return n
+        data = self.incoming_buffer.get_next(n)
+        self.info_(f"Received all {n} bytes ({data[:10]}...)")
+        return data
 
     def is_closed(self):
         with self.closed_lock:
             return self.closed
 
     def close(self):
-        self.debug_("Closing...")
+        self.info_("Closing...")
+        # logger.setLevel(logging.DEBUG)
+        super().close()
         with self.closed_lock:
             self.closed = True
-
-        super().close()
         self.listen_thread.join()
         self.transmission_thread.join()
-        self.debug_("Closed...")
+        self.info_("Closed")
