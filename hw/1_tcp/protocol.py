@@ -44,14 +44,22 @@ class UDPBasedProtocol:
 
 
 class MyTCPHeader:
-    # payload_size, seq_num, ack_num, flags (syn,ack,...), sack_count
-    FMT = '!5I'
+    # seg_id, payload_size, seq_num, ack_num, flags (syn,ack,...), sack_count
+    FMT = '!6I'
     FMT_SACK_BLOCK = '!2I'
     F_SYN = 0
     F_ACK = 1
     MAX_SACK_COUNT = 4
 
-    def __init__(self, seq_num, ack_num, syn, ack, sack_count=0, sack_blocks=None, payload_size=0):
+    @classmethod
+    def generate_id(cls):
+        return random.randint(0, 2**32 - 1)
+
+    def __init__(self, seq_num, ack_num, syn, ack, sack_count=0, sack_blocks=None, payload_size=0, seg_id=None):
+        if seg_id == None:
+            seg_id = MyTCPHeader.generate_id()
+        
+        self.seg_id = seg_id
         self.payload_size = payload_size
         self.seq_num = seq_num
         self.ack_num = ack_num
@@ -66,6 +74,7 @@ class MyTCPHeader:
                 (1 << self.F_ACK) * int(self.ack)
         packed_data = struct.pack(
             self.FMT,
+            self.seg_id,
             self.payload_size,
             self.seq_num,
             self.ack_num,
@@ -82,11 +91,12 @@ class MyTCPHeader:
     @classmethod
     def from_tcp_segment(cls, segment, offset=0):
         unpacked_data = struct.unpack_from(cls.FMT, segment, offset)
-        payload_size = unpacked_data[0]
-        seq_num = unpacked_data[1]
-        ack_num = unpacked_data[2]
-        flags = unpacked_data[3]
-        sack_count = unpacked_data[4]
+        seg_id = unpacked_data[0]
+        payload_size = unpacked_data[1]
+        seq_num = unpacked_data[2]
+        ack_num = unpacked_data[3]
+        flags = unpacked_data[4]
+        sack_count = unpacked_data[5]
         assert sack_count < cls.MAX_SACK_COUNT
         syn = bool(flags & (1 << cls.F_SYN))
         ack = bool(flags & (1 << cls.F_ACK))
@@ -94,7 +104,7 @@ class MyTCPHeader:
         for block_idx in range(sack_count):
             sack_blocks.append(struct.unpack_from(
                 cls.FMT_SACK_BLOCK, segment, offset + cls.size(block_idx)))
-        return cls(seq_num, ack_num, syn, ack, sack_count, sack_blocks, payload_size)
+        return cls(seq_num, ack_num, syn, ack, sack_count, sack_blocks, payload_size, seg_id)
 
     @classmethod
     def size(cls, sack_count=None):
@@ -462,7 +472,7 @@ class MyTCPProtocol(UDPBasedProtocol):
             window_begin = new_window_begin
         
         # window_begin == window_final --- все дошли
-        self.info_(f"Sent all {total} bytes {old_data}")
+        self.info_(f"Sent all {total} bytes {old_data[:10]}...")
         return total
 
     def recv(self, n: int):
