@@ -1,3 +1,4 @@
+import binascii
 import errno
 import random
 import socket
@@ -11,7 +12,7 @@ import traceback
 
 # logging.basicConfig(format='%(message)s')
 logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.CRITICAL)
 logger.debug("Logger created")
 handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(logging.Formatter('%(message)s'))
@@ -44,8 +45,8 @@ class UDPBasedProtocol:
 
 
 class MyTCPHeader:
-    # seg_id, payload_size, seq_num, ack_num, flags (syn,ack,...), sack_count
-    FMT = '!6I'
+    # seg_id, payload_size, check_sum, seq_num, ack_num, flags (syn,ack,...), sack_count
+    FMT = '!7I'
     FMT_SACK_BLOCK = '!2I'
     F_SYN = 0
     F_ACK = 1
@@ -55,12 +56,13 @@ class MyTCPHeader:
     def generate_id(cls):
         return random.randint(0, 2**32 - 1)
 
-    def __init__(self, seq_num, ack_num, syn, ack, sack_count=0, sack_blocks=None, payload_size=0, seg_id=None):
+    def __init__(self, seq_num, ack_num, syn, ack, sack_count=0, sack_blocks=None, payload_size=0, check_sum=0, seg_id=None):
         if seg_id == None:
             seg_id = MyTCPHeader.generate_id()
         
         self.seg_id = seg_id
         self.payload_size = payload_size
+        self.check_sum = check_sum
         self.seq_num = seq_num
         self.ack_num = ack_num
         self.syn = syn
@@ -76,6 +78,7 @@ class MyTCPHeader:
             self.FMT,
             self.seg_id,
             self.payload_size,
+            self.check_sum,
             self.seq_num,
             self.ack_num,
             flags,
@@ -93,10 +96,11 @@ class MyTCPHeader:
         unpacked_data = struct.unpack_from(cls.FMT, segment, offset)
         seg_id = unpacked_data[0]
         payload_size = unpacked_data[1]
-        seq_num = unpacked_data[2]
-        ack_num = unpacked_data[3]
-        flags = unpacked_data[4]
-        sack_count = unpacked_data[5]
+        check_sum = unpacked_data[2]
+        seq_num = unpacked_data[3]
+        ack_num = unpacked_data[4]
+        flags = unpacked_data[5]
+        sack_count = unpacked_data[6]
         assert sack_count < cls.MAX_SACK_COUNT
         syn = bool(flags & (1 << cls.F_SYN))
         ack = bool(flags & (1 << cls.F_ACK))
@@ -104,7 +108,7 @@ class MyTCPHeader:
         for block_idx in range(sack_count):
             sack_blocks.append(struct.unpack_from(
                 cls.FMT_SACK_BLOCK, segment, offset + cls.size(block_idx)))
-        return cls(seq_num, ack_num, syn, ack, sack_count, sack_blocks, payload_size, seg_id)
+        return cls(seq_num, ack_num, syn, ack, sack_count, sack_blocks, payload_size, check_sum, seg_id)
 
     @classmethod
     def size(cls, sack_count=None):
@@ -301,9 +305,10 @@ class OutcomingBuffer(Buffer):
 
 class MyTCPProtocol(UDPBasedProtocol):
     IP_HEADER_SIZE = 60
-    MTU = 65536 - IP_HEADER_SIZE - MyTCPHeader.size()
-    WINDOW_SIZE = MTU * 16
-    DELAY = 0.15
+    MTU = 64000
+    MAX_SEG_SIZE = MTU - MyTCPHeader.size()
+    WINDOW_SIZE = MAX_SEG_SIZE * 16
+    DELAY = 0.05
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -346,6 +351,7 @@ class MyTCPProtocol(UDPBasedProtocol):
     def build_segment(cls, header: MyTCPHeader, payload: bytes | None = None) -> bytes:
         if payload is not None:
             header.payload_size = len(payload)
+            header.check_sum = binascii.crc32(payload)
         segment = header.to_bytes()
         if payload is not None:
             segment += payload
@@ -369,6 +375,10 @@ class MyTCPProtocol(UDPBasedProtocol):
                 self.outcoming_buffer.acknowledge(left, right)
                 self.debug_(f"SAck on [{left}, {right}]")
         if header.payload_size > 0:
+            if header.check_sum != binascii.crc32(data):
+                self.critical_(f"Brocken data segment {header.seg_id}!")
+                return
+            
             self.incoming_buffer.put(data, header.payload_size, header.seq_num)
             self.debug_(f"Incoming data [{header.seq_num}, {header.seq_num + header.payload_size}) -- {data[:10]}...")
             self.send_acknowledgement_()
@@ -459,11 +469,11 @@ class MyTCPProtocol(UDPBasedProtocol):
         while window_begin != window_final:
             # Насыщение окна
             while window_end != window_final and window_end - window_begin < self.WINDOW_SIZE:
-                piece = data[:self.MTU]
+                piece = data[:self.MAX_SEG_SIZE]
                 piece_size = self.send_part_(piece)
                 total += piece_size
                 window_end += piece_size
-                data = data[self.MTU:]
+                data = data[self.MAX_SEG_SIZE:]
             
             # Сдвиг левой части
             _, new_window_begin = self.outcoming_buffer.wait_window_change(window_begin)
